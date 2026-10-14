@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+results/
+wandb/
+checkpoints/
+data/*/feat_*/
+*.pth
+*.bin
+.venv/
