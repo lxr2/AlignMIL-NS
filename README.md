@@ -2,7 +2,7 @@
 
 Official code for the MICCAI 2026 paper [Aligning Prototypes and Updating Null Spaces for Continual WSI Learning](https://papers.miccai.org/miccai-2026/0045-Paper2958.html).
 
-The continual learning framework follows [Mammoth](https://github.com/aimagelab/mammoth), and the implementation builds on [QPMIL-VL](https://github.com/can-can-ya/QPMIL-VL).
+The continual learning framework follows [Mammoth](https://github.com/aimagelab/mammoth), and the implementation builds on [QPMIL-VL](https://github.com/can-can-ya/QPMIL-VL), which is also included as a baseline (`model: QPMIL_VL`).
 
 ## Installation
 
@@ -43,22 +43,28 @@ data/
 
 ## Training
 
-To run all 5 folds in both task orders:
+To train AlignMIL-NS on all 5 folds in both task orders:
 
 ```bash
 GPU=0 bash scripts/train.sh
+```
+
+To run the [QPMIL-VL](https://github.com/can-can-ya/QPMIL-VL) baseline:
+
+```bash
+GPU=0 bash scripts/train.sh configs/qpmil_vl_fw.yaml configs/qpmil_vl_rv.yaml
 ```
 
 To run a single fold:
 
 ```bash
 # forward order: CAMELYON16 -> LUNG -> BRCA -> ESCA -> RCC
-uv run python main.py -f configs/ex_cl_fw.yaml seed=1 name=alignmil
+uv run python main.py -f configs/ex_cl_fw.yaml seed=1 name=main
 # reverse order
-uv run python main.py -f configs/ex_cl_rv.yaml seed=1 name=alignmil
+uv run python main.py -f configs/ex_cl_rv.yaml seed=1 name=main
 ```
 
-The default configs are the ones used for the reported results. A few implementation details differ from the paper text: the learning rate is 0.01; the class similarity loss of QPMIL-VL (`beta=0.5`) is added to the total loss; the null space is spanned by up to the 20 smallest singular values; and the null-space update (Eq. 8) is applied after every epoch of later tasks with step size `tunable_v_lr`.
+The `ex_cl_*` configs are the ones used for the reported AlignMIL-NS results. A few implementation details differ from the paper text: the learning rate is 0.01; the class similarity loss of QPMIL-VL (`beta=0.5`) is added to the total loss; the null space is spanned by up to the 20 smallest singular values; and the null-space update (Eq. 8) is applied after every epoch of later tasks with step size `tunable_v_lr`.
 
 Any config key can be overridden on the command line (e.g. `cuda_id=1 wandb=online`). Results are saved to `results/<config>/<name>/train-data_split_seed_<seed>/`. After the `seed=5` run, the results of all five folds are summarized in `results/<config>/<name>/metrics/`.
 

@@ -1,4 +1,5 @@
 # AlignMIL
+model: AlignMIL # [AlignMIL, QPMIL_VL]
 tunable_v_lr: 0.5 # step size of the null-space update of old class features
 class_feature_thr: 0.4 # gamma: margin of the null-space update (Eq. 7)
 wandb: disabled # [online, offline, disabled]

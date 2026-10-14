@@ -15,7 +15,7 @@ from torchmetrics import ConfusionMatrix
 
 from utils import get_device, BinClf_Evaluator, MultiClf_Evaluator, get_loss_function, get_init_key_frequency, mkdir_if_missing, get_current_ensemble_classes, rename_keys, check_feature_distribution, plot_key_matching_heatmap, get_current_eval_dataloader
 from models.conch import create_model_from_pretrained
-from models import freeze_weight, set_tunable_v, EarlyStopping, AlignMIL
+from models import freeze_weight, set_tunable_v, EarlyStopping, AlignMIL, QPMIL_VL
 from dataset import get_data_loaders, get_sids
 from utils.tools import get_null_space, plot_confusion_matrix
 
@@ -23,6 +23,9 @@ from utils.tools import get_null_space, plot_confusion_matrix
 class Manager(object):
     def __init__(self, cfg):
         self.cfg = cfg
+        # AlignMIL (ours) or the QPMIL_VL baseline; PCFA and the null space update are only used by AlignMIL
+        self.model_name = cfg.get('model', 'AlignMIL')
+        assert self.model_name in ['AlignMIL', 'QPMIL_VL'], 'Invalid model: {}'.format(self.model_name)
 
         self.device = get_device(cfg['cuda_id'])
 
@@ -60,7 +63,10 @@ class Manager(object):
         # Parameters to be trained: Prototype Pool (key, prompt)
         if cfg['opt_name'] == 'adam':
             self.key = nn.ParameterList([nn.Parameter(0.02 * torch.randn(1, self.feature_dim, dtype=self.dtype, device=self.device)) for _ in range(cfg['pool_size'])])
-            self.prompt = nn.ParameterList([nn.Parameter(0.02 * torch.randn(1, self.feature_dim, dtype=self.dtype, device=self.device)) for _ in range(cfg['pool_size'])])
+            if self.model_name == 'AlignMIL': # learnable prototype vectors
+                self.prompt = nn.ParameterList([nn.Parameter(0.02 * torch.randn(1, self.feature_dim, dtype=self.dtype, device=self.device)) for _ in range(cfg['pool_size'])])
+            else: # learnable prompts encoded by the language encoder
+                self.prompt = nn.ParameterList([nn.Parameter(0.02 * torch.randn(1, cfg['prompt_length'], self.embedding_dim, dtype=self.dtype, device=self.device)) for _ in range(cfg['pool_size'])])
             print('[setup] Parameters to be trained:\nPrototype Pool\nkey:\n{}\nprompt:\n{}'.format(self.key, self.prompt))
         else:
             raise NotImplementedError('Invalid optimizer')
@@ -115,9 +121,12 @@ class Manager(object):
             print('[setup] Wandb writer construction completed')
 
             # model
-            set_tunable_v(self.tunable_v, self.current_dataset_idx) # Only the tunable vectors of the current dataset classes are trained.
-            self.model = AlignMIL(self.cfg, self.base_model, self.device, self.key, self.prompt, self.tunable_v, self.current_ensemble_classes, self.train_key_frequency)
-            print('[setup] AlignMIL construction completed')
+            if self.model_name == 'AlignMIL':
+                set_tunable_v(self.tunable_v, self.current_dataset_idx) # Only the tunable vectors of the current dataset classes are trained.
+                self.model = AlignMIL(self.cfg, self.base_model, self.device, self.key, self.prompt, self.tunable_v, self.current_ensemble_classes, self.train_key_frequency)
+            else:
+                self.model = QPMIL_VL(self.cfg, self.base_model, self.device, self.key, self.prompt, self.tunable_v, self.current_ensemble_classes, self.train_key_frequency)
+            print('[setup] {} construction completed'.format(self.model_name))
 
             # optimizer
             if self.cfg['opt_name'] == 'adam':
@@ -155,7 +164,8 @@ class Manager(object):
             # run training
             self._run_training()
 
-            self.cal_null_space()
+            if self.model_name == 'AlignMIL':
+                self.cal_null_space()
 
             # evaluate at val/test dataset
             eval_result_dir = osp.join(self.current_save_result_dir, 'eval_results')
@@ -427,24 +437,25 @@ class Manager(object):
 
             train_cltor = self._train_each_epoch()
 
-            # update tunable_v of old classes within their null spaces, Eq. 8
-            tunable_v_delta = {}
-            tun_lr = self.cfg['tunable_v_lr']
-            print('[info] Tunable V update (lr):', tun_lr)
-            with torch.no_grad():
-                for old_task in self.cfg["seen_task_dict"].keys()-{self.current_dataset}:
-                    dataset_idx = self.cfg["seen_task_dict"][old_task]
-                    for subtype in range(self.cfg['dataset_subtype_num'][dataset_idx]):
-                        old_label = self.cfg['dataset_label_shift'][dataset_idx] + subtype
-                        if self.phi[old_label].shape[1] > 0:
-                            self.tunable_v[dataset_idx][subtype] = self.tunable_v[dataset_idx][subtype] + tun_lr * self.alpha[old_label] @ self.phi[old_label].t() # [1, C]
-                            tunable_v_delta[old_label] = self.alpha[old_label] @ self.phi[old_label].t() # [1, C]
-            print(f'[info] Tunable V update (norm):')
-            for k, v in tunable_v_delta.items():
-                print(f'  {k}: {v.norm()}')
-            print(f'[info] Tunable V update (abs max):')
-            for k, v in tunable_v_delta.items():
-                print(f'  {k}: {v.abs().max()}')
+            if self.model_name == 'AlignMIL':
+                # update tunable_v of old classes within their null spaces, Eq. 8
+                tunable_v_delta = {}
+                tun_lr = self.cfg['tunable_v_lr']
+                print('[info] Tunable V update (lr):', tun_lr)
+                with torch.no_grad():
+                    for old_task in self.cfg["seen_task_dict"].keys()-{self.current_dataset}:
+                        dataset_idx = self.cfg["seen_task_dict"][old_task]
+                        for subtype in range(self.cfg['dataset_subtype_num'][dataset_idx]):
+                            old_label = self.cfg['dataset_label_shift'][dataset_idx] + subtype
+                            if self.phi[old_label].shape[1] > 0:
+                                self.tunable_v[dataset_idx][subtype] = self.tunable_v[dataset_idx][subtype] + tun_lr * self.alpha[old_label] @ self.phi[old_label].t() # [1, C]
+                                tunable_v_delta[old_label] = self.alpha[old_label] @ self.phi[old_label].t() # [1, C]
+                print(f'[info] Tunable V update (norm):')
+                for k, v in tunable_v_delta.items():
+                    print(f'  {k}: {v.norm()}')
+                print(f'[info] Tunable V update (abs max):')
+                for k, v in tunable_v_delta.items():
+                    print(f'  {k}: {v.abs().max()}')
 
             for k_cltor, v_cltor in train_cltor.items():
                 self.train_key_frequency[self.current_dataset].append(v_cltor['all_key_frequencies']) # contains all the frequencies in every epochs, len = n_epochs
@@ -719,7 +730,10 @@ class Manager(object):
             class_end = class_st + self.cfg['dataset_subtype_num'][idx]
             class_indices_dict[dataset] = list(range(class_st, class_end))
 
-        bag_preds, loss_dict, key_indices, feature_dict = self.model(xs, current_dataset=self.current_dataset, class_indices=class_indices_dict) # [MB, num_cls]
+        if self.model_name == 'AlignMIL':
+            bag_preds, loss_dict, key_indices, feature_dict = self.model(xs, current_dataset=self.current_dataset, class_indices=class_indices_dict) # [MB, num_cls]
+        else:
+            bag_preds, loss_dict, key_indices, feature_dict = self.model(xs) # [MB, num_cls]
 
         # zero gradients buffer
         self.optimizer.zero_grad()
@@ -730,7 +744,7 @@ class Manager(object):
 
         # total loss
         total_loss = clf_loss + self.cfg['lambda'] * loss_dict['matching_loss'] + self.cfg['beta'] * loss_dict['class_sim_loss']
-        if len(self.dataset2key_idx) > 1 and len(self.dataset2key_idx) == len(class_indices_dict):
+        if self.model_name == 'AlignMIL' and len(self.dataset2key_idx) > 1 and len(self.dataset2key_idx) == len(class_indices_dict):
             pc_loss = self.model.compute_prototype_class_loss(self.dataset2key_idx, self.current_dataset, class_indices=class_indices_dict) # PCFA
             total_loss += pc_loss
             print(
